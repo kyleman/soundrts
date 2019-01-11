@@ -20,7 +20,7 @@ if platform.system() == "Windows":
     # problem with F10 and DirectX, so use windib
     os.environ["SDL_VIDEODRIVER"] = "windib"
 
-fullscreen = False
+fullscreen = True
 
 
 def update_display_caption():
