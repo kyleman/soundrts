@@ -11,28 +11,30 @@ import clientgame
 from clientgameorder import update_orders_list
 import definitions
 import config
-from constants import METASERVER_URL, PROFILE
 from definitions import style, rules
 from lib.log import warning, exception
-from mapfile import Map
 from lib.msgs import nb2msg
-from paths import REPLAYS_PATH, SAVE_PATH, STATS_PATH
+from mapfile import Map
+import msgparts as mp
+from paths import CUSTOM_BINDINGS_PATH, REPLAYS_PATH, SAVE_PATH
 import random
 import res
 import stats
 from version import VERSION, compatibility_version
 from world import World
-from worldclient import DirectClient, Coordinator, ReplayClient, DummyClient, HalfDummyClient, send_platform_version_to_metaserver 
+from worldclient import DirectClient, Coordinator, ReplayClient, DummyClient, RemoteClient, send_platform_version_to_metaserver 
+
+
+PROFILE = False
 
 
 class _Game(object):
 
     default_triggers = () # empty tuple; a tuple is immutable
     game_type_name = None
-    alliances = ()
-    factions = ()
     record_replay = True
     allow_cheatmode = True
+    must_apply_equivalent_type = False
 
     def create_replay(self):
         self._replay_file = open(os.path.join(REPLAYS_PATH, "%s.txt" % int(time.time())), "w")
@@ -48,8 +50,10 @@ class _Game(object):
         else:
             self.replay_write(self.map.pack())
         self.replay_write(players)
-        self.replay_write(" ".join(map(str, self.alliances)))
-        self.replay_write(" ".join(self.factions))
+        alliances = [p.alliance for p in self.players]
+        self.replay_write(" ".join(map(str, alliances)))
+        factions = [p.faction for p in self.players]
+        self.replay_write(" ".join(factions))
         self.replay_write(str(self.seed))
 
     def replay_write(self, s):
@@ -61,25 +65,30 @@ class _Game(object):
                              self.nb_human_players)
 
     def _record_stats(self, world):
-        s = stats.Stats(STATS_PATH, METASERVER_URL)
-        s.add(self._game_type(), int(world.time / 1000))
+        stats.add(self._game_type(), int(world.time / 1000))
 
     def run(self, speed=config.speed):
         if self.record_replay:
             self.create_replay()
-        self.world = World(self.default_triggers, self.seed)
+        self.world = World(self.default_triggers, self.seed, must_apply_equivalent_type=self.must_apply_equivalent_type)
         if self.world.load_and_build_map(self.map):
             self.map.load_style(res)
             try:
                 self.map.load_resources()
                 update_orders_list() # when style has changed
                 self.pre_run()
+                if self.world.objective:
+                    voice.confirmation(mp.OBJECTIVE + self.world.objective)
                 self.interface = clientgame.GameInterface(self.me, speed=speed)
-                self.interface.load_bindings(
-                    res.get_text_file("ui/bindings", append=True, localize=True) + "\n" +
-                    self.map.get_campaign("ui/bindings.txt") + "\n" +
-                    self.map.get_additional("ui/bindings.txt"))
-                self.world.populate_map(self.players, self.alliances, self.factions)
+                b = res.get_text_file("ui/bindings", append=True, localize=True)
+                b += "\n" + self.map.get_campaign("ui/bindings.txt")
+                b += "\n" + self.map.get_additional("ui/bindings.txt")
+                try:
+                    b += "\n" + open(CUSTOM_BINDINGS_PATH, "U").read()
+                except IOError:
+                    pass
+                self.interface.load_bindings(b)
+                self.world.populate_map(self.players)
                 self.nb_human_players = self.world.current_nb_human_players()
                 t = threading.Thread(target=self.world.loop)
                 t.daemon = True
@@ -87,16 +96,23 @@ class _Game(object):
                 if PROFILE:
                     import cProfile
                     cProfile.runctx("self.interface.loop()", globals(), locals(), "interface_profile.tmp")
+                    import pstats
+                    for n in ("interface_profile.tmp", ):
+                        p = pstats.Stats(n)
+                        p.strip_dirs()
+                        p.sort_stats('time', 'cumulative').print_stats(30)
+                        p.print_callers(30)
+                        p.print_callees(20)
+                        p.sort_stats('cumulative').print_stats(50)
                 else:
                     self.interface.loop()
                 self._record_stats(self.world)
                 self.post_run()
             finally:
                 self.map.unload_resources()
-            self.world.clean()
+            self.world.stop()
         else:
-            voice.alert([1029]) # hostile sound
-            voice.alert([self.world.map_error])
+            voice.alert(mp.BEEP + [self.world.map_error])
         if self.record_replay:
             self._replay_file.close()
 
@@ -119,61 +135,63 @@ class _MultiplayerGame(_Game):
         ["players", ["no_building_left"], ["defeat"]],
         ["computers", ["no_unit_left"], ["defeat"]],
         ) # a tuple is immutable
+    must_apply_equivalent_type = True
 
 
 class MultiplayerGame(_MultiplayerGame):
 
     game_type_name = "multiplayer"
 
-    def __init__(self, map, players, my_login, main_server, seed, speed):
+    def _clients(self, players, local_login, main_server):
+        clients = []
+        for login, a, f in players:
+            if login.startswith("ai_"):
+                c = DummyClient(login[3:])
+            else:
+                if login != local_login:
+                    c = RemoteClient(login)
+                else:
+                    c = Coordinator(local_login, main_server, self)
+                    self.me = c
+            c.alliance = a
+            c.faction = f
+            clients.append(c)
+        return clients
+
+    @property
+    def humans(self):
+        return [c for c in self.players if c.__class__ != DummyClient]
+
+    def __init__(self, map, players, local_login, main_server, seed, speed):
         self.map = map
-        computers, humans = self._computers_and_humans(players, my_login)
-        self.me = Coordinator(my_login, main_server, humans, self)
-        humans[humans.index(None)] = self.me
-        self.players = humans + computers # humans first because the first in the list is the game admin
+        self.players = self._clients(players, local_login, main_server)
         self.seed = seed
         self.speed = speed
         self.main_server = main_server
-        if len(humans) > 1:
+        if len(self.humans) > 1:
             self.allow_cheatmode = False
 
     def run(self):
         _MultiplayerGame.run(self, speed=self.speed)
 
     def _countdown(self):
-        voice.important([4062]) # "the game starts in 5 seconds"
+        voice.important(mp.THE_GAME_WILL_START)
         for n in [5, 4, 3, 2, 1, 0]:
             voice.item(nb2msg(n))
             time.sleep(1)
         pygame.event.clear(KEYDOWN)
 
     def pre_run(self):
-        nb_human_players = len([p for p in self.players if p.login != "ai"])
-        if nb_human_players > 1:
-            send_platform_version_to_metaserver(self.map.get_name(), nb_human_players)
+        if len(self.humans) > 1:
+            send_platform_version_to_metaserver(self.map.get_name(), len(self.humans))
             self._countdown()
 
     def post_run(self):
-        # alert the server of the exit from the game interface
-        if self.interface.forced_quit:
-            self.main_server.write_line("abort_game")
-        else:
-            self.main_server.write_line("quit_game")
-        self.say_score() # say score only after quit_game to avoid blocking the main server
-        voice.menu([4010, 4030]) # "menu" "please make a selection" (long enough to allow history navigation)
-
-    def _computers_and_humans(self, players, my_login):
-        computers = []
-        humans = []
-        for p in players:
-            if p in ["ai_aggressive", "ai_easy"]:
-                computers.append(DummyClient(p[3:]))
-            else:
-                if p != my_login:
-                    humans.append(HalfDummyClient(p))
-                else:
-                    humans.append(None) # marked for further replacement, because the order must be the same (the worlds must be the same)
-        return computers, humans
+        self.main_server.write_line("quit_game")
+        # say score only after quit_game to avoid blocking the main server
+        self.say_score()
+        voice.menu(mp.MENU + mp.MAKE_A_SELECTION)
+        # (long enough to allow history navigation)
 
 
 class _Savable(object):
@@ -197,10 +215,10 @@ class _Savable(object):
             self._replay_file_content = open(self._replay_file.name).read()
         try:
             pickle.dump(self, f)
-            voice.info([105])
+            voice.info(mp.OK)
         except:
             exception("save game failed")
-            voice.alert([1029]) # hostile sound
+            voice.alert(mp.BEEP)
         self.world.restore_links_for_savegame()
 
     def run_on(self):
@@ -218,18 +236,10 @@ class _Savable(object):
             t = threading.Thread(target=self.world.loop)
             t.daemon = True
             t.start()
-            # Because the simulation is in a different thread,
-            # sometimes the interface "forgets" to ask for an
-            # update. Maybe a better communication protocol
-            # between interface and simulation would solve
-            # this problem ("update" and "no_end_of_update_yet"
-            # should contain the simulation time, maybe). Maybe
-            # some data in a queue has been lost.
-            self.interface.asked_to_update = False
             self.interface.loop()
             self._record_stats(self.world)
             self.post_run()
-            self.world.clean()
+            self.world.stop()
         finally:
             self.map.unload_resources()
 
@@ -238,11 +248,13 @@ class TrainingGame(_MultiplayerGame, _Savable):
 
     game_type_name = "training"
 
-    def __init__(self, map, players):
+    def __init__(self, map, players, factions):
         self.map = map
         self.seed = random.randint(0, 10000)
         self.me = DirectClient(config.login, self)
         self.players = [self.me] + [DummyClient(x) for x in players[1:]]
+        for p, f in zip(self.players, factions):
+            p.faction = f
 
 
 class MissionGame(_Game, _Savable):
@@ -286,6 +298,7 @@ class ReplayGame(_Game):
         game_type_name = self.replay_read()
         if game_type_name in ("multiplayer", "training"):
             self.default_triggers = _MultiplayerGame.default_triggers
+            self.must_apply_equivalent_type = True
         game_name = self.replay_read()
         voice.alert([game_name])
         version = self.replay_read()
@@ -293,7 +306,7 @@ class ReplayGame(_Game):
         res.set_mods(mods)
         _compatibility_version = self.replay_read()
         if _compatibility_version != compatibility_version():
-            voice.alert([1029, 4012]) # hostile sound  "version error"
+            voice.alert(mp.BEEP + mp.VERSION_ERROR)
             warning("Version mismatch. Version should be: %s. Mods should be: %s.",
                     version, mods)
         campaign_path_or_packed_map = self.replay_read()
@@ -304,17 +317,22 @@ class ReplayGame(_Game):
             self.map = Map()
             self.map.unpack(campaign_path_or_packed_map)
         players = self.replay_read().split()
-        self.alliances = map(int, self.replay_read().split())
-        self.factions = self.replay_read().split()
+        alliances = self.replay_read().split()
+        factions = self.replay_read().split()
         self.seed = int(self.replay_read())
         self.me = ReplayClient(players[0], self)
         self.players = [self.me]
         for x in players[1:]:
-            if x in ["aggressive", "easy"]: # the "ai_" prefix wasn't recorded
+            if x.startswith("ai_"):
+                x = x[3:]
+            if x in ["aggressive", "easy", "ai2"]:
                 self.players += [DummyClient(x)]
             else:
-                self.players += [HalfDummyClient(x)]
+                self.players += [RemoteClient(x)]
                 self.me.nb_humans += 1
+        for p, a, f in zip(self.players, alliances, factions):
+            p.alliance = a
+            p.faction = f
 
     def replay_read(self):
         s = self._file.readline()
@@ -323,7 +341,7 @@ class ReplayGame(_Game):
         return s
 
     def pre_run(self):
-        voice.info([4316])
+        voice.info(mp.OBSERVE_ANOTHER_PLAYER_EXPLANATION)
         voice.flush()
 
     def run(self):

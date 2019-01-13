@@ -5,14 +5,18 @@ import pygame
 
 from clientgamenews import must_be_said
 from clientmedia import voice, sounds, get_fullscreen
-from constants import FOOTSTEP_LIMIT  
+import config
 from definitions import style
 from lib.log import warning, exception
 from lib.msgs import nb2msg
 from lib.nofloat import PRECISION
 from worldunit import BuildingSite
 from lib.sound import psounds, distance
+import msgparts as mp
 
+
+# minimal interval (in seconds) between 2 sounds
+FOOTSTEP_LIMIT = .1
 
 def compute_title(type_name):
     t = style.get(type_name, "title")
@@ -46,7 +50,15 @@ class EntityView(object):
     def __init__(self, interface, model):
         self.interface = interface
         self.model = model
-        self.footstep_interval = .5 + random.random() * .2 # to avoid strange synchronicity of footsteps when several units are walking
+        self.footstep_random = random.random() * .2 # to avoid strange synchronicity of footsteps when several units are walking
+
+    @property
+    def footstep_interval(self):
+        try:
+            s = self.model.actual_speed
+        except:
+            s = self.model.speed
+        return 1000.0 / s / 2 + self.footstep_random
 
     @property
     def when_moving_through(self):
@@ -84,13 +96,13 @@ class EntityView(object):
     @property
     def ext_title(self):
         try:
-            return self.title + [107] + self.place.title
+            return self.title + mp.AT + self.place.title
         except:
             exception("problem with %s.ext_title", self.type_name)
 
     def _menu(self, strict=False):
         menu = []
-        try: # XXX remove this "try... except" when rules.txt checking is implemented
+        try: # TODO: remove this "try... except" when rules.txt checking is implemented
             for order_class in get_orders_list():
                 menu.extend(order_class.menu(self, strict=strict))
         except:
@@ -140,12 +152,12 @@ class EntityView(object):
         if self.player:
             if self.player == self.interface.player:
                 title += nb2msg(self.number)
-            elif self.player in self.interface.player.allied:
-                title += [4286] + nb2msg(self.player.number) + [self.player.client.login] # "allied 2"
-            elif hasattr(self.player, "number") and self.player.number:
-                title += [88] + nb2msg(self.player.number) + [self.player.client.login] # "ennemy 2"
-            else: # "npc_ai"
-                title += [88] # enemy
+            else:
+                if self.player in self.interface.player.allied:
+                    title += mp.ALLY
+                else:
+                    title += mp.ENEMY
+                title += mp.COMMA + self.player.name + mp.COMMA
         return title
 
     @property
@@ -154,12 +166,12 @@ class EntityView(object):
 
     @property
     def hp_status(self):
-        return nb2msg(self.hp) + [39] + nb2msg(self.hp_max)
+        return nb2msg(self.hp) + mp.HITPOINTS_ON + nb2msg(self.hp_max)
 
     @property
     def mana_status(self):
         if self.mana_max > 0:
-            return nb2msg(self.mana) + [4247] + nb2msg(self.mana_max)
+            return nb2msg(self.mana) + mp.MANA_POINTS_ON + nb2msg(self.mana_max)
         else:
             return []
 
@@ -175,20 +187,21 @@ class EntityView(object):
         d = []
         try:
             if hasattr(self, "qty") and self.qty:
-                d += [134] + nb2msg(self.qty) + style.get("parameters", "resource_%s_title" % self.resource_type)
+                d += mp.CONTAINS + nb2msg(self.qty) \
+                     + style.get("parameters",
+                                 "resource_%s_title" % self.resource_type)
             if hasattr(self, "hp"):
                 d += self.hp_status
             if hasattr(self, "mana"):
                 d += self.mana_status
             if hasattr(self, "upgrades"):
                 d += self.upgrades_status
-            if hasattr(self, "is_invisible_or_cloaked") and \
-               self.is_invisible_or_cloaked():
-                d += [9998, 4289]
+            if getattr(self, "is_invisible", 0) or getattr(self, "is_cloaked", 0):
+                d += mp.COMMA + mp.INVISIBLE
             if getattr(self, "is_a_detector", 0):
-                d += [9998, 4290]
+                d += mp.COMMA + mp.DETECTOR
             if getattr(self, "is_a_cloaker", 0):
-                d += [9998, 4291]
+                d += mp.COMMA + mp.CLOAKER
         except:
             pass # a warning is given by style.get()
         return d
@@ -222,10 +235,19 @@ class EntityView(object):
         else:
             return self.color()
 
+    def _terrain_footstep(self):
+        t = self.place.type_name
+        if t:
+            g = style.get(t, "ground")
+            if g and style.has(self.type_name, "move_on_%s" % g[0]):
+                return style.get(self.type_name, "move_on_%s" % g[0])
+
     def footstepnoise(self):
         # assert: "only immobile objects must be taken into account"
         result = style.get(self.type_name, "move")
-        if self.airground_type == "ground":
+        if self.airground_type == "ground" and self._terrain_footstep():
+            return self._terrain_footstep()
+        elif self.airground_type == "ground" and len(self.place.objects) < 30: # save CPU
             d_min = 9999999
             for m in self.place.objects:
                 if getattr(m, "speed", 0):
@@ -240,17 +262,20 @@ class EntityView(object):
                         o = self.interface.dobjets[m.id]
                     except KeyError: # probably caused by the world client updates
                         continue
-                    d = distance(o.x, o.y, self.x, self.y) / k
+                    try:
+                        d = distance(o.x, o.y, self.x, self.y) / k
+                    except ZeroDivisionError:
+                        continue
                     if d < d_min:
                         result = style.get(self.type_name, "move_on_%s" % g[0])
                         d_min = d
         return result
 
     def footstep(self):
-        if self.is_moving:
+        if self.is_moving and not self.is_memory:
             if self.next_step is None:
                 self.step_side = 1
-                self.next_step = time.time() + random.random() * self.footstep_interval # start at different moments
+                self.next_step = time.time() + random.random() * self.footstep_interval / self.interface.real_speed # start at different moments
             elif time.time() > self.next_step:
                 if self.interface.immersion and (self.x, self.y) == (self.interface.x, self.interface.y):
                     v = 1 / 2.0
@@ -260,7 +285,7 @@ class EntityView(object):
                     self.launch_event(self.footstepnoise()[self.step_side], v, priority=-10, limit=FOOTSTEP_LIMIT)
                 except IndexError:
                     pass
-                self.next_step = time.time() + self.footstep_interval / self.interface.speed
+                self.next_step = time.time() + self.footstep_interval / self.interface.real_speed
                 self.step_side = 1 - self.step_side
         else:
             self.next_step = None
@@ -438,7 +463,16 @@ class EntityView(object):
 
     def launch_event(self, sound, volume=1, priority=0, limit=0, ambient=False):
         if self.place is self.interface.place:
-            return psounds.play(sounds.get_sound(sound), volume, self.x, self.y, priority, limit, ambient)
+            pass
+        elif self.place in getattr(self.interface.place, "neighbors", []):
+            priority -= 1
+            # Diminishing the volume is necessary as long as
+            # "in the fog of war" squares are implemented
+            # by shifting the observer backwards along the y axis.
+            volume /= 4.0
+        else:
+            return
+        return psounds.play(sounds.get_sound(sound), volume, self.x, self.y, priority, limit, ambient)
 
     def launch_alert(self, sound):
         self.interface.launch_alert(self.place, sound)
@@ -480,12 +514,10 @@ class EntityView(object):
         if get_fullscreen() and attacker_id in self.interface.dobjets:
             self.interface.grid_view.display_attack(attacker_id, self)
 
-    def on_enter_square(self):
-        pass
-
     def on_exhausted(self):
         self.launch_event_style("exhausted")
-        voice.info(self.title + [144])
+        if "resource_exhausted" in config.verbosity:
+            voice.info(self.title + mp.EXHAUSTED)
 
     def on_completeness(self, s): # building train or upgrade
         self.launch_event_style("production")
@@ -494,7 +526,7 @@ class EntityView(object):
     def on_complete(self):
         if self.player is not self.interface.player: return
         self.launch_event_style("complete", alert=True)
-        if must_be_said(self.number):
+        if "unit_complete" in config.verbosity and must_be_said(self.number):
             voice.info(substitute_args(self.get_style("complete_msg"), [self.title]))
         self.interface.send_menu_alerts_if_needed() # not necessary for "on_repair_complete" (if it existed)
 
@@ -504,7 +536,7 @@ class EntityView(object):
 
     def on_added(self):
         self.launch_event_style("added", alert=True)
-        if must_be_said(self.number):
+        if "unit_added" in config.verbosity and must_be_said(self.number):
             voice.info(substitute_args(self.get_style("added_msg"), [self.ext_title]))
 
 

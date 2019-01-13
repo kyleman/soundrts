@@ -6,6 +6,8 @@ from lib.screen import get_screen, draw_line, draw_rect
 from lib.log import warning
 from lib.nofloat import square_of_distance
 
+from definitions import style
+
 
 R = int(0.5 * 10)
 R2 = R * R
@@ -33,17 +35,20 @@ class GridView(object):
         for xc in range(0, self.interface.xcmax + 1):
             for yc in range(0, self.interface.ycmax + 1):
                 sq = self.interface.server.player.world.grid[(xc, yc)]
-                if sq in self.interface.server.player.detected_squares:
-                    color = (0, 25, 25)
-                elif sq in self.interface.server.player.observed_squares:
+                color = style.get(sq.type_name, "color", warn_if_not_found=False)
+                try:
+                    color = pygame.Color(color[0])
+                except:
                     color = (0, 25, 0)
-                elif sq in self.interface.server.player.observed_before_squares:
-                    color = (15, 15, 15)
-                else:
-                    color = (0, 0, 0)
-                    continue
                 if sq.high_ground:
                     color = (color[0]*2, color[1]*2, color[2]*2)
+                if sq in self.interface.server.player.observed_before_squares \
+                   and sq not in self.interface.server.player.observed_squares:
+                    color = (color[0]/10 + 15, color[1]/10 + 15, color[2]/10 + 15)
+                elif sq not in self.interface.server.player.observed_squares:
+                    color = (0, 0, 0)
+                    continue
+                color = map(lambda x: min(x, 255), color)
                 draw_rect(color, self._get_rect_from_map_coords(xc, yc))
                 squares_to_view.append(sq)
         # walls
@@ -90,7 +95,7 @@ class GridView(object):
                 color = (0,55,0)
             elif o.player in self.interface.player.allied:
                 color = (0,0,155)
-            elif o.player.is_an_enemy(self.interface.player):
+            elif o.player.player_is_an_enemy(self.interface.player):
                 color = (155,0,0)
             else:
                 color = (0, 0, 0)
@@ -173,7 +178,7 @@ class GridView(object):
         x, y = pos
         for o in self.interface.dobjets.values():
             xo, yo = self._object_coords(o)
-            if square_of_distance(x, y, xo, yo) <= R2 + 1: # XXX + 1 ?
+            if square_of_distance(x, y, xo, yo) <= R2 + 1: # is + 1 necessary?
                 return o
 
     def units_from_mouserect(self, pos, pos2):

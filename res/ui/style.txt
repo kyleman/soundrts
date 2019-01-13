@@ -21,7 +21,7 @@ and 23
 resource_0_title 131
 resource_1_title 132
 food_title 133
-recommended_maps jl5
+recommended_maps jl8 jl7 jl6 jl5
 
 ; units menus
 
@@ -32,6 +32,10 @@ title 4282
 def go
 title 100 115
 index 1
+
+def attack ; imperative go
+title 114
+; no index (won't appear in the menu)
 
 def patrol
 title 103 115
@@ -92,6 +96,22 @@ index 8
 def upgrade_to
 title 4214 4219 $1 ; if the order is "upgrade_to keep", $1 is replaced with the title of "keep"
 index 9
+
+def enable_auto_gather
+title 4355
+index 9.4
+
+def disable_auto_gather
+title 4356
+index 9.4
+
+def enable_auto_repair
+title 4353
+index 9.5
+
+def disable_auto_repair
+title 4354
+index 9.5
 
 def mode_offensive
 title 104 110
@@ -290,12 +310,85 @@ is_a unit
 move 1053 1054
 move_on_grass 1053 1054
 move_on_leaves 1069 1070
-move_on_gravel 1068 1068
-move_on_wood 1067 1067
+move_on_gravel 1344 1345
+move_on_wood 1067 1350
+move_on_mud 1087 1349
+move_on_water 1088 1348
+move_on_snow 1346 1347
 
 def resource_deposit
 is_a thing
 exhausted
+
+
+; terrain
+
+def _meadows ; this terrain is applied automatically to any square with meadows and without woods
+title 4362
+noise
+ground ; footstep noise determined by the nearest object
+color
+
+def _forest ; this terrain is applied automatically to any square with some woods
+title 4363
+noise
+ground ; footstep noise determined by the nearest object
+color
+
+def _dense_forest ; this terrain is applied automatically to any square with many woods
+title 4364
+noise
+ground ; footstep noise determined by the nearest object
+color
+
+def river
+title 4346
+noise loop 1065
+color blue4
+
+def lake
+title 4345
+noise loop 1342
+color blue4
+
+def sea
+title 4344
+noise loop 1342
+color blue
+
+def ocean
+title 4351
+noise loop 1089
+color blue
+
+def mountain
+title 4347
+noise loop 1000
+color dimgray
+
+def mountain_pass
+title 4352
+noise loop 1000
+ground snow
+
+def big_bridge
+title 4348
+noise loop 1065
+ground wood
+color brown
+
+def ford
+title 4349
+noise loop 1090
+ground water
+color blue2
+
+def marsh
+title 4350
+noise loop 1343
+ground mud
+color brown
+
 
 ; buildings
 
@@ -420,6 +513,10 @@ def massive_gate
 is_a building
 title 4339
 
+def shipyard
+is_a building
+title 4357
+
 ; units
 
 def peasant
@@ -535,6 +632,36 @@ title 110 4230 ; offensive flying machine
 launch_attack 1322
 attack_hit 1323
 shortcut f
+
+def boat
+is_a unit
+title 4358
+move 1088 1088
+keyboard soldier7
+
+def destroyer
+is_a unit
+title 4359
+launch_attack 1042
+attack_hit 1043
+attack_hit_level_1 1301
+move 1088 1088
+keyboard soldier7
+
+def battleship
+is_a unit
+title 4360
+noise repeat 9 1311 1312 1313 ; 1082 1083 ?
+launch_attack 1084
+attack_hit 1085
+move 1088 1088
+keyboard soldier7
+
+def submarine
+is_a unit
+title 4361
+move 1088 1088
+keyboard soldier7
 
 def holy_vision
 is_a thing

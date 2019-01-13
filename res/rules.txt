@@ -218,7 +218,7 @@ food_cost 1
 time_cost 10
 hp_max 4
 speed 1.5
-can_build farm barracks lumbermill blacksmith wall gate scouttower townhall stables workshop dragonslair magestower temple necropolis
+can_build farm barracks lumbermill blacksmith wall gate scouttower townhall stables workshop dragonslair magestower temple necropolis shipyard
 ;can_use a_improved_wood_gathering
 range 0.8
 cooldown 1
@@ -244,6 +244,7 @@ class soldier
 food_cost 0
 hp_max 23
 speed 1
+speed_on_terrain marsh 1 ford 1
 can_use melee_weapon melee_armor
 armor 0.5
 armor_bonus 1
@@ -294,6 +295,7 @@ class soldier
 food_cost 0
 hp_max 15
 speed 1.5
+speed_on_terrain marsh 1.5 ford 1.5
 can_use archer_weapon archer_armor archer_range
 armor 0
 cooldown 1.5
@@ -384,6 +386,7 @@ hp_max 30
 mana_max 200
 mana_regen 1 ; mana / second
 speed 1
+speed_on_terrain marsh 1 ford 1
 can_use a_raise_dead a_deadly_fog
 range 6
 cooldown 1.5
@@ -436,6 +439,84 @@ is_repairable 1
 is_healable 0
 transport_volume 99
 corpse 0
+
+def boat
+class soldier
+cost 5 5
+food_cost 1
+time_cost 10
+airground_type water
+hp_max 30
+speed 1.5
+is_repairable 1
+is_healable 0
+transport_capacity 8
+transport_volume 99
+corpse 0
+
+def destroyer
+class soldier
+cost 11 4
+food_cost 2
+time_cost 14
+requirements lumbermill
+hp_max 43;  130/3
+speed 1.5
+is_repairable 1
+is_healable 0
+airground_type water
+range 6
+is_ballistic 1
+cooldown 1.5
+damage 6 ; 6-16
+target_types ground air
+armor 1 ; armor 20
+can_use archer_weapon archer_range
+transport_volume 99
+corpse 0
+
+def battleship
+class soldier
+cost 15 10
+food_cost 3
+time_cost 30
+requirements lumbermill workshop
+hp_max 30
+speed 0.75
+range 12
+minimal_range 4
+is_ballistic 1
+cooldown 4
+damage 8
+damage_radius 0.25
+splash 1
+is_repairable 1
+is_healable 0
+airground_type water
+transport_volume 99
+corpse 0
+
+def submarine
+class soldier
+cost 11 4
+food_cost 1
+time_cost 14
+hp_max 43;  130/3
+speed 1.5
+is_repairable 1
+is_healable 0
+airground_type water
+range 6
+is_ballistic 1
+cooldown 1.5
+damage 6 ; 6-16
+armor 1 ; armor 20
+requirements lumbermill magestower
+can_use archer_weapon archer_range
+transport_volume 99
+corpse 0
+is_invisible 1
+is_a_detector 1
 
 ; buildings
 
@@ -651,6 +732,16 @@ is_a_gate 1
 provides_survival 0
 requirements keep
 
+def shipyard
+class building
+cost 10 15
+food_provided 0
+hp_max 266.7;  800/3
+time_cost 90
+is_buildable_near_water_only 1
+requirements townhall lumbermill
+can_train boat destroyer battleship submarine
+
 ; other units
 
 def instant_death ; used by some maps to create dead units
@@ -680,13 +771,10 @@ harm_level 1
 harm_target_type ground unit
 
 def holy_vision
-class soldier
-presence 0 ; casting holy vision on a square doesn't trigger "player has entered the square"
-food_cost 0
-corpse 0
-is_vulnerable 0
+class effect
 is_invisible 1
 is_a_detector 1
+airground_type air
 
 def exorcism
 class effect

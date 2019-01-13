@@ -7,35 +7,46 @@ except ImportError:
     from md5 import md5
 import os.path
 import Queue
+import random
 import re
 import string
 import time
 
+from lib import chronometer as chrono
 from lib import collision
-from constants import COLLISION_RADIUS, VIRTUAL_TIME_INTERVAL, PROFILE
-from definitions import rules, get_ai_names, load_ai
+from definitions import rules, get_ai_names, load_ai, VIRTUAL_TIME_INTERVAL
 from lib.log import warning, exception, info
 from lib.nofloat import to_int, int_distance, PRECISION
+import msgparts as mp
 from paths import MAPERROR_PATH
 import res
 from worldability import Ability
 from worldclient import DummyClient
+from worldentity import COLLISION_RADIUS
 from worldexit import passage
 from worldorders import ORDERS_DICT
-from worldplayerbase import Player, normalize_cost_or_resources
+from worldplayerbase import Player, normalize_cost_or_resources, A
 from worldplayercomputer import Computer
-from worldplayerhuman import Human
-import worldrandom
+from worldplayercomputer2 import Computer2
 from worldresource import Deposit, Meadow
 from worldroom import Square
-from worldunit import Unit, Worker, Soldier, Building, Effect
+from worldunit import Unit, Worker, Soldier, Building, _Building, Effect, ground_or_air
 from worldupgrade import Upgrade
 
 
 GLOBAL_FOOD_LIMIT = 80
+PROFILE = False
+
+def check_squares(line, squares):
+    for sq in squares:
+        if re.match("^[a-z]+[0-9]+$", sq) is None:
+            map_error(line, "%s is not a square" % sq)
 
 
 class Type(object):
+
+    def __repr__(self):
+        return "<Type '%s'>" % self.type_name
 
     def init_dict(self, target):
         target.type_name = self.type_name
@@ -55,10 +66,12 @@ class Type(object):
         self.__name__ = name
         self.type_name = name
         self.cls = bases[0]
-        if "sight_range" in dct:
-            del dct["sight_range"]
+        if "cost" not in dct and hasattr(self.cls, "cost"):
+            dct["cost"] = [0] * rules.get("parameters", "nb_of_resource_types")
+        if "sight_range" in dct and dct["sight_range"] == 1 * PRECISION:
+            dct["sight_range"] = 12 * PRECISION
             dct["bonus_height"] = 1
-            info("in %s: replacing sight_range 1 with bonus_height 1", name)
+            info("in %s: replacing sight_range 1 with sight_range 12 and bonus_height 1", name)
         if "special_range" in dct:
             del dct["special_range"]
             dct["range"] = 12 * PRECISION
@@ -79,16 +92,15 @@ class Type(object):
             raise AttributeError
 
 
-# POSSIBLE TODO: a world doesn't know what is a player or a game...
-# ... except for the resources and tech?!!! and alliances, ennemies
-# rename "player" to "economy", "country", "tribe", "side",
-# "force", "faction", "team"?)
 class World(object):
 
-    def __init__(self, default_triggers, seed=0):
+    def __init__(self, default_triggers, seed=0, must_apply_equivalent_type=False):
         self.default_triggers = default_triggers
+        self.seed = seed
+        self.must_apply_equivalent_type = must_apply_equivalent_type
         self.id = self.get_next_id()
-        worldrandom.seed(int(seed))
+        self.random = random.Random()
+        self.random.seed(int(seed))
         self.time = 0
         self.squares = []
         self.active_objects = []
@@ -98,6 +110,48 @@ class World(object):
         self.objects = {}
         self.harm_target_types = {}
         self._command_queue = Queue.Queue()
+
+        # "map" properties
+
+        self.objective = []
+        self.intro = []
+        self.timer_coefficient = 1
+
+        self.map_objects = []
+
+        self.computers_starts = []
+        self.players_starts = []
+        self.starting_units = []
+        self.starting_resources = [] # just for the editor
+        self.specific_starts = [] # just for the editor
+
+        self.square_width = 12 # default value
+        self.nb_lines = 0
+        self.nb_columns = 0
+        self.nb_rows = 0 # deprecated (was incorrectly used for columns instead of lines)
+        self.nb_meadows_by_square = 0
+
+        self.west_east = []
+        self.south_north = []
+
+        self.terrain = {}
+        self.terrain_speed = {}
+        self.terrain_cover = {}
+        self.water_squares = set()
+        self.no_air_squares = set()
+        self.ground_squares = set()
+
+        # "squares words"
+        self.starting_squares = []
+        self.additional_meadows = []
+        self.remove_meadows = []
+        self.high_grounds = []
+
+        self.nb_players_min = 1
+        self.nb_players_max = 1
+
+    def __repr__(self):
+        return "World(%s)" % self.seed
 
     def __getstate__(self):
         odict = self.__dict__.copy()
@@ -117,8 +171,12 @@ class World(object):
         for z in self.squares:
             for e in z.exits:
                 e.place = z
-        self.set_neighbours()
-        
+        self.set_neighbors()
+
+    @property
+    def turn(self):
+        return self.time / VIRTUAL_TIME_INTERVAL
+
     _next_id = 0 # reset ID for each world to avoid big numbers
 
     def get_next_id(self, increment=True):
@@ -149,11 +207,42 @@ class World(object):
         return [o for z in self.squares for o in z.objects
                 if filter(o) and square_of_distance(x, y, o.x, o.y) <= radius_2]
 
+    def get_objects2(self, x, y, radius, filter=lambda x: True, players=None):
+        if not players:
+            players = self.players
+        radius_2 = radius * radius
+        return [o for p in players for o in p._potential_neighbors(x, y)
+                if filter(o) and square_of_distance(x, y, o.x, o.y) <= radius_2]
+
     def get_place_from_xy(self, x, y):
         return self.grid.get((x / self.square_width,
                               y / self.square_width))
 
-    def clean(self):
+    def get_subsquare_id_from_xy(self, x, y):
+        return x * 3 / self.square_width, y * 3 / self.square_width
+
+    def can_harm(self, unit_type_name, other_type_name): 
+        try:
+            return self.harm_target_types[(unit_type_name, other_type_name)]
+        except:
+            unit = self.unit_class(unit_type_name)
+            other = self.unit_class(other_type_name)
+            if other is None:
+                result = False
+            else:
+                result = True
+                for t in unit.harm_target_type:
+                    if t == "healable" and not other.is_healable or \
+                       t == "building" and not other.is_a_building or \
+                       t in ("air", "ground") and ground_or_air(other.airground_type) != t or \
+                       t == "unit" and not other.is_a_unit or \
+                       t == "undead" and not other.is_undead:
+                        result = False
+                        break
+            self.harm_target_types[(unit_type_name, other_type_name)] = result
+            return result
+
+    def _free_memory(self):
         for p in self.players + self.ex_players:
             p.clean()
         for z in self.squares:
@@ -161,27 +250,41 @@ class World(object):
         self.__dict__ = {}
 
     def _get_objects_values(self):
-        names_to_check = ["x", "y", "hp", "action_target"]
-        if self.time == 0:
-            names_to_check += ["id", "player"]
-            objects_to_check = []
-            for z in self.squares:
-                objects_to_check += z.objects
-        else:
-            objects_to_check = self.active_objects
-        for o in objects_to_check:
-            for name in names_to_check:
-                if hasattr(o, name):
-                    value = getattr(o, name)
-                    if name in ["action_target", "player"]:
-                        if hasattr(value, "id"):
-                            value = value.id
-                        else:
-                            continue
-                    yield "%s%s" % (name, value)
+        yield str(self.random.getstate())
+##        yield "starting_squares = {}".format(self.starting_squares)
+##        names_to_check = ["type_name", "id", "x", "y", "hp", "action_target"]
+##        if self.time == 0:
+##            names_to_check += ["id", "player"]
+##            objects_to_check = []
+##            for z in self.squares:
+##                objects_to_check += z.objects
+##        else:
+##            objects_to_check = self.active_objects
+##        yield str(self.starting_squares)
+##        for o in objects_to_check:
+##            if getattr(o, "orders", False):
+##                yield o.orders[0].keyword
+##                if o.orders[0].keyword == "auto_explore":
+##                    yield "already=" + str(sorted(list(o.player._already_explored),key=lambda x: getattr(x, "name", None)))
+##                    yield "_places_to_explore=" + str(o.player._places_to_explore)
+##            for name in names_to_check:
+##                if hasattr(o, name):
+##                    value = getattr(o, name)
+##                    if name in ["action_target", "player"]:
+##                        if hasattr(value, "id"):
+##                            value = value.id
+##                            if value in self.objects:
+##                                if self.objects[value].__class__.__name__ == "Exit":
+##                                    value = value, self.objects[value]
+##                                else:
+##                                    value = value, self.objects[value].__class__.__name__
+##                        else:
+##                            continue
+##                    yield "%s=%s" % (name, value)
+##            yield ""
 
     def get_objects_string(self):
-        return "".join(self._get_objects_values())
+        return "\n".join(self._get_objects_values())
 
     def get_digest(self):
         d = md5(str(self.time))
@@ -193,10 +296,75 @@ class World(object):
             d.update(ov)
         return d.hexdigest()
 
+    def _update_buckets(self):
+        for p in self.players:
+            p._buckets = {}
+            for u in p.units:
+                k = (u.x / A, u.y / A)
+                try:
+                    p._buckets[k].append(u)
+                except:
+                    p._buckets[k] = [u]
+
+    def _update_cloaking(self):
+        for p in self.players:
+            for u in p.units:
+                if u.is_cloakable:
+                    u.is_cloaked = False
+        for p in self.players:
+            for u in p.units:
+                if u.is_a_cloaker:
+                    radius2 = u.cloaking_range * u.cloaking_range
+                    for vp in p.allied:
+                        for vu in vp._potential_neighbors(u.x, u.y):
+                            if not vu.is_cloakable or vu.is_cloaked: continue
+                            if square_of_distance(vu.x, vu.y, u.x, u.y) < radius2:
+                                vu.is_cloaked = True
+                                continue
+
+    def _update_detection(self):
+        for p in self.players:
+            p.detected_units = set()
+        for p in self.players:
+            for u in p.units:
+                if u.is_a_detector:
+                    radius2 = u.detection_range * u.detection_range
+                    for e in self.players:
+                        if e in p.allied: continue
+                        for iu in e._potential_neighbors(u.x, u.y):
+                            if not (iu.is_invisible or iu.is_cloaked): continue
+                            if iu in p.detected_units: continue
+                            if square_of_distance(iu.x, iu.y, u.x, u.y) < radius2:
+                                for a in p.allied_vision:
+                                    a.detected_units.add(iu)
+                                continue
+
+    previous_state = (0, "")
+
+    def _record_sync_debug_info(self):
+        try:
+            self.previous_previous_state = self.previous_state
+        except AttributeError:
+            pass
+        self.previous_state = self.time, self.get_objects_string()
+
+    def cpu_intensive_players(self):
+        return [p for p in self.players if p.is_cpu_intensive]
+
+    def _update_terrain(self):
+        for s in self.squares:
+            if s.type_name in ["", "_meadows", "_forest", "_dense_forest"]:
+                s.update_terrain()
+
     _previous_slow_update = 0
 
     def update(self):
+        chrono.start("update")
         # normal updates
+        self._update_terrain()
+        self._update_buckets()
+        self._update_cloaking()
+        self._update_detection()
         for p in self.players[:]:
             if p in self.players:
                 try:
@@ -228,11 +396,18 @@ class World(object):
                         exception("")
             self._previous_slow_update += 1000
 
+        # remove from perception the objects deleted during this turn
+        for p in self.players:
+            for o in p.perception.copy():
+                if o.place is None:
+                    p.perception.remove(o)
+
+        chrono.stop("update")
+        self._record_sync_debug_info()
+
         # signal the end of the updates for this time
         self.time += VIRTUAL_TIME_INTERVAL
         for p in self.players[:]:
-            if p.is_human():
-                p.ready = False
             try:
                 def _copy(l):
                     return set(copy.copy(o) for o in l)
@@ -245,7 +420,7 @@ class World(object):
                         observed_before_squares = p.observed_before_squares
                     p.push("voila", self.time,
                            _copy(p.memory), _copy(p.perception),
-                           p.observed_squares.keys(),
+                           p.observed_squares,
                            observed_before_squares,
                            collision_debug)
             except:
@@ -256,7 +431,6 @@ class World(object):
             for p in self.players:
                 p.quit_game()
 
-    ground = []
     global_food_limit = GLOBAL_FOOD_LIMIT
 
     # move the following methods to Map
@@ -304,8 +478,12 @@ class World(object):
         
     def get_makers(self, t):
         def can_make(uc, t):
-            for a in ("can_build", "can_train", "can_upgrade_to"):
+            for a in ("can_build", "can_train", "can_upgrade_to", "can_research"):
                 if t in getattr(uc, a, []):
+                    return True
+            for ability in getattr(uc, "can_use", []):
+                effect = rules.get(ability, "effect")
+                if effect and "summon" in effect[:1] and t in effect:
                     return True
         if t.__class__ != str:
             t = t.__name__
@@ -322,9 +500,9 @@ class World(object):
 
     # map creation
 
-    def set_neighbours(self):
+    def set_neighbors(self):
         for square in set(self.grid.values()):
-            square.set_neighbours()
+            square.set_neighbors()
 
     def _create_squares_and_grid(self):
         self.grid = {}
@@ -334,11 +512,23 @@ class World(object):
                 self.grid[square.name] = square
                 self.grid[(col, row)] = square
                 square.high_ground = square.name in self.high_grounds
-        self.set_neighbours()
+                if square.name in self.terrain:
+                    square.type_name = self.terrain[square.name]
+                if square.name in self.terrain_speed:
+                    square.terrain_speed = self.terrain_speed[square.name]
+                if square.name in self.terrain_cover:
+                    square.terrain_cover = self.terrain_cover[square.name]
+                if square.name in self.water_squares:
+                    square.is_water = True
+                    square.is_ground = square.name in self.ground_squares
+                if square.name in self.no_air_squares:
+                    square.is_air = False
+        self.set_neighbors()
         xmax = self.nb_columns * self.square_width
         res = COLLISION_RADIUS * 2 / 3
         self.collision = {"ground": collision.CollisionMatrix(xmax, res),
                           "air": collision.CollisionMatrix(xmax, res)}
+        self.collision["water"] = self.collision["ground"]
 
     def _meadows(self):
         m = []
@@ -367,24 +557,73 @@ class World(object):
             z.arrange_resources_symmetrically(xc, yc)
 
     def _we_places(self, i):
+        is_a_portal = False
         t = string.ascii_lowercase
         col = t.find(i[0]) + 1
         if col == self.nb_columns:
             col = 0
+            is_a_portal = True
         j = t[col] + i[1:]
         if not self.grid.has_key(j):
             map_error("", "The west-east passage starting from %s doesn't exist." % i)
-        return self.grid[i].east_side(), self.grid[j].west_side()
+        return self.grid[i].east_side(), self.grid[j].west_side(), is_a_portal
 
     def _sn_places(self, i):
+        is_a_portal = False
         line = int(i[1:]) + 1
         if line == self.nb_lines + 1:
             line = 1
+            is_a_portal = True
         j = i[0] + str(line)
         if not self.grid.has_key(j):
             map_error("", "The south-north passage starting from %s doesn't exist." % i)
-        return self.grid[i].north_side(), self.grid[j].south_side()
+        return self.grid[i].north_side(), self.grid[j].south_side(), is_a_portal
 
+    def _ground_graph(self):
+        g = {}
+        for z in self.squares:
+            for e in z.exits:
+                g[e] = {}
+                for f in z.exits:
+                    if f is not e:
+                        g[e][f] = int_distance(e.x, e.y, f.x, f.y)
+                g[e][e.other_side] = 0
+        return g
+
+    def _air_graph(self):
+        g = {}
+        for z in self.squares:
+            g[z] = {}
+            if not z.is_air:
+                continue
+            # This is not perfect. Some diagonals will be missing.
+            if [z2 for z2 in z.strict_neighbors if not z2.is_air]:
+                n = z.strict_neighbors
+            else:
+                n = z.neighbors
+            for z2 in n:
+                if not z2.is_air:
+                    continue
+                g[z][z2] = int_distance(z.x, z.y, z2.x, z2.y)
+        return g  
+
+    def _water_graph(self):
+        g = {}
+        for z in self.squares:
+            g[z] = {}
+            if not z.is_water:
+                continue
+            # This is not perfect. Some diagonals will be missing.
+            if [z2 for z2 in z.strict_neighbors if not z2.is_water]:
+                n = z.strict_neighbors
+            else:
+                n = z.neighbors
+            for z2 in n:
+                if not z2.is_water:
+                    continue
+                g[z][z2] = int_distance(z.x, z.y, z2.x, z2.y)
+        return g  
+                
     def _create_passages(self):
         for t, squares in self.west_east:
             for i in squares:
@@ -392,20 +631,19 @@ class World(object):
         for t, squares in self.south_north:
             for i in squares:
                 passage(self._sn_places(i), t)
+
+    def _create_graphs(self):
         self.g = {}
-        for z in self.squares:
-            for e in z.exits:
-                self.g[e] = {}
-                for f in z.exits:
-                    if f is not e:
-                        self.g[e][f] = int_distance(e.x, e.y, f.x, f.y)
-                self.g[e][e.other_side] = 0
+        self.g["ground"] = self._ground_graph()
+        self.g["air"] = self._air_graph()
+        self.g["water"] = self._water_graph()
 
     def _build_map(self):
         self._create_squares_and_grid()
         self._create_resources()
         self._arrange_resources_symmetrically()
         self._create_passages()
+        self._create_graphs()
 
     def _add_start_to(self, starts, resources, items, sq=None):
         def is_a_square(x):
@@ -428,7 +666,7 @@ class World(object):
 
     @property
     def nb_res(self):
-        return int(rules.get("parameters", "nb_of_resource_types")[0])
+        return rules.get("parameters", "nb_of_resource_types")
 
     def _add_start(self, w, words, line):
         # get start type
@@ -484,49 +722,16 @@ class World(object):
             else:
                 map_error("", "error in trigger for %s: unknown owner" % o)
 
+    def random_choice_repl(self, matchobj):
+        return self.random.choice(matchobj.group(1).split("\n#end_choice\n"))
+
     def _load_map(self, map):
-        
-        def random_choice_repl(matchobj):
-            return worldrandom.choice(matchobj.group(1).split("\n#end_choice\n"))
-
-        def check_squares(squares):
-            for sq in squares:
-                if re.match("^[a-z]+[0-9]+$", sq) is None:
-                    map_error(line, "%s is not a square" % sq)
-
-        self.objective = []
-        self.intro = []
-        self.timer_coefficient = 1
         triggers = []
-
-        self.map_objects = []
-
-        self.computers_starts = []
-        self.players_starts = []
-        self.starting_units = []
+        starting_resources = [0 for _ in range(self.nb_res)]
 
         squares_words = ["starting_squares",
                          "additional_meadows", "remove_meadows",
                          "high_grounds"]
-
-        self.square_width = 12 # default value
-        self.nb_lines = 0
-        self.nb_columns = 0
-        self.nb_rows = 0 # deprecated (was incorrectly used for columns instead of lines)
-        self.nb_meadows_by_square = 0
-
-        self.west_east = []
-        self.south_north = []
-
-        # "squares words"
-        self.starting_squares = []
-        self.additional_meadows = []
-        self.remove_meadows = []
-        self.high_grounds = []
-
-        self.starting_resources = [0 for _ in range(self.nb_res)]
-        self.nb_players_min = 1
-        self.nb_players_max = 1
 
         s = map.read() # "universal newlines"
         s = re.sub("(?m);.*$", "", s) # remove comments
@@ -535,7 +740,7 @@ class World(object):
         s = s.replace("(", " ( ")
         s = s.replace(")", " ) ")
         s = re.sub(r"\s*\n\s*", r"\n", s) # strip lines
-        s = re.sub(r"(?ms)^#random_choice\n(.*?)\n#end_random_choice$", random_choice_repl, s)
+        s = re.sub(r"(?ms)^#random_choice\n(.*?)\n#end_random_choice$", self.random_choice_repl, s)
         s = re.sub(r"(?m)^(goldmine|wood)s\s+([0-9]+)\s+(.*)$", r"\1 \2 \3", s)
         s = re.sub(r"(south_north|west_east)_paths", r"\1 path", s)
         s = re.sub(r"(south_north|west_east)_bridges", r"\1 bridge", s)
@@ -547,7 +752,7 @@ class World(object):
             if w[0:1] == ";":
                 continue # comment
             for _w in words[1:]:
-                if w in ["south_north", "west_east"]:
+                if w in ["south_north", "west_east", "terrain", "speed", "cover"]:
                     continue # TODO: check that the exit type_name is defined in style
                 for _w in _w.split(","):
                     if _w and _w[0] == "-": _w = _w[1:]
@@ -574,17 +779,18 @@ class World(object):
                     map_error(line, "%s must be an integer" % w)
             elif w in ["south_north", "west_east"]:
                 squares = words[2:]
-                check_squares(squares)
+                check_squares(line, squares)
                 getattr(self, w).append((words[1], squares))
             elif w in squares_words:
                 squares = words[1:]
-                check_squares(squares)
+                check_squares(line, squares)
                 getattr(self, w).extend(squares)
             elif w in ["starting_resources"]:
-                self.starting_resources = []
+                self.starting_resources = " ".join(words[1:]) # just for the editor
+                starting_resources = []
                 for c in words[1:]:
                     try:
-                        self.starting_resources.append(to_int(c))
+                        starting_resources.append(to_int(c))
                     except:
                         map_error(line, "expected an integer but found %s" % c)
             elif rules.get(w, "class") == ["deposit"]:
@@ -593,15 +799,46 @@ class World(object):
             elif w in ["starting_units"]:
                 getattr(self, w).extend(words[1:]) # TODO: error msg (types)
             elif w in ["player", "computer_only", "computer"]:
+                self.specific_starts.append(" ".join(words)) # just for the editor
                 self._add_start(w, words, line)
             elif w == "trigger":
                 triggers.append(words[1:])
+            elif w == "terrain":
+                t = words[1]
+                squares = words[2:]
+                check_squares(line, squares)
+                for sq in squares:
+                    self.terrain[sq] = t
+            elif w == "speed":
+                t = tuple(int(float(x) * 100) for x in words[1:3])
+                squares = words[3:]
+                check_squares(line, squares)
+                for sq in squares:
+                    self.terrain_speed[sq] = t
+            elif w == "cover":
+                t = tuple(int(float(x) * 100) for x in words[1:3])
+                squares = words[3:]
+                check_squares(line, squares)
+                for sq in squares:
+                    self.terrain_cover[sq] = t
+            elif w == "water":
+                squares = words[1:]
+                check_squares(line, squares)
+                self.water_squares.update(squares)
+            elif w == "ground":
+                squares = words[1:]
+                check_squares(line, squares)
+                self.ground_squares.update(squares)
+            elif w == "no_air":
+                squares = words[1:]
+                check_squares(line, squares)
+                self.no_air_squares.update(squares)
             else:
                 map_error(line, "unknown command: %s" % w)
         # build self.players_starts
         for sq in self.starting_squares:
             self._add_start_to(self.players_starts,
-                               self.starting_resources, self.starting_units, sq)
+                               starting_resources, self.starting_units, sq)
         if self.nb_players_min > self.nb_players_max:
             map_error("", "nb_players_min > nb_players_max")
         if len(self.players_starts) < self.nb_players_max:
@@ -626,17 +863,14 @@ class World(object):
             self.map = map
             self.square_width = int(self.square_width * PRECISION)
             self._build_map()
-            if self.objective:
-                self.introduction = [4020] + self.objective
-            else:
-                self.introduction = []
         except MapError, msg:
             warning("map error: %s", msg)
             self.map_error = "map error: %s" % msg
             return False
         return True
 
-    def get_factions(self):
+    @property
+    def factions(self):
         return [c for c in rules.classnames()
                 if rules.get(c, "class") == ["faction"]]
 
@@ -645,7 +879,7 @@ class World(object):
     def current_nb_human_players(self):
         n = 0
         for p in self.players:
-            if p.is_human():
+            if p.is_human:
                 n += 1
         return n
 
@@ -660,74 +894,142 @@ class World(object):
     def food_limit(self):
         return self.global_food_limit
 
-    def _add_player(self, player_class, client, start, *args):
-        client.player = player_class(self, client, *args)
-        self.players.append(client.player)
-        client.player.start = start
+    def _add_player(self, client, start):
+        player = client.player_class(self, client)
+        player.start = start
+        client.player = player
+        self.players.append(player)
 
-    def populate_map(self, players, alliances, factions=()):
-        # add "true" (non neutral) players
-        worldrandom.shuffle(self.players_starts)
+    def _create_true_players(self, players, random_starts):
+        starts = self.players_starts[:]
+        if random_starts:
+            self.random.shuffle(starts)
         for client in players:
-            start = self.players_starts.pop()
-            if client.__class__.__name__ == "DummyClient":
-                self._add_player(Computer, client, start, False)
-            else:
-                self._add_player(Human, client, start)
-        # create the alliances
-        if alliances:
-            for p, pa in zip(self.players, alliances):
-                for other, oa in zip(self.players, alliances):
-                    if other is not p and oa == pa:
-                        p.allied.append(other)
-        else: # computer players are allied by default
-            for p in self.players:
-                if isinstance(p, Computer):
-                    for other in self.players:
-                        if other is not p and isinstance(other, Computer):
-                            p.allied.append(other)
-        # set the factions for players
-        if factions:
-            for p, pr in zip(self.players, factions):
-                if pr == "random_faction":
-                    p.faction = worldrandom.choice(self.get_factions())
-                else:
-                    p.faction = pr
-        # add "neutral" (independent) computers
+            start = starts.pop(0)
+            self._add_player(client, start)
+        for p in self.players:
+            p.init_alliance()
+
+    def _create_neutrals(self):
         for start in self.computers_starts:
-            self._add_player(Computer, DummyClient(), start, True)
-        # init all players positions
+            self._add_player(DummyClient(neutral=True), start)
+
+    def populate_map(self, players, random_starts=True):
+        self._create_true_players(players, random_starts)
+        self._create_neutrals()
         for player in self.players:
             player.init_position()
-        self.admin = players[0] # define get_admin()?
+
+    def stop(self):
+        self._must_loop = False
+
+    def _loop(self):
+        self._must_loop = True
+        while(self._must_loop):
+            if not self._command_queue.empty():
+                player, order = self._command_queue.get()
+                try:
+                    if player is None:
+                        order()
+                    else:
+                        player.execute_command(order)
+                except:
+                    exception("")
+            else:
+                time.sleep(.001)
 
     def loop(self):
-        def _loop():
-            while(self.__dict__): # cf clean()
-                if not self._command_queue.empty():
-                    player, order = self._command_queue.get()
-                    try:
-                        player.execute_command(order)
-                    except:
-                        exception("")
-                else:
-                    time.sleep(.01)
         if PROFILE:
             import cProfile
-            cProfile.runctx("_loop()", globals(), locals(), "world_profile.tmp")
+            cProfile.runctx("self._loop()", globals(), locals(), "world_profile.tmp")
             import pstats
-            for n in ("interface_profile.tmp", "world_profile.tmp"):
+            for n in ("world_profile.tmp", ):
                 p = pstats.Stats(n)
                 p.strip_dirs()
                 p.sort_stats('time', 'cumulative').print_stats(30)
                 p.print_callers(30)
                 p.print_callees(20)
                 p.sort_stats('cumulative').print_stats(50)
+                p.print_callers(100)
+                p.print_callees(100)
         else:
-            _loop()
+            self._loop()
+        self._free_memory()
 
     def queue_command(self, player, order):
         self._command_queue.put((player, order))
+
+    def save_map(self, filename):
+        def _sorted(squares):
+            return sorted(squares, key=lambda n: (n[0], int(n[1:])))
+        def res():
+            return sorted(set((o.type_name, o.qty / PRECISION) for s in set(self.grid.values()) for o in s.objects if getattr(o, "resource_type", None) is not None),
+                          key=lambda x: (x[0], -x[1]))
+        with open(filename, "w") as f:
+            f.write("title %s\n" % " ".join(map(str, self.title)))
+            f.write("objective %s\n" % " ".join(map(str, self.objective)))
+            f.write("\n")
+            f.write("square_width %s\n" % (self.square_width / PRECISION))
+            f.write("nb_columns %s\n" % self.nb_columns)
+            f.write("nb_lines %s\n" % self.nb_lines)
+            f.write("\n")
+            f.write("nb_players_min %s\n" % self.nb_players_min)
+            f.write("nb_players_max %s\n" % self.nb_players_max)
+            f.write("starting_squares %s\n" % " ".join(_sorted(self.starting_squares)))
+            f.write("starting_units %s\n" % " ".join(self.starting_units))
+            f.write("starting_resources %s\n" % self.starting_resources)
+            for line in self.specific_starts:
+                f.write(line + "\n")
+            f.write("\n")
+            for t, q in res():
+                squares = _sorted(s.name for s in set(self.grid.values()) for o in s.objects if o.type_name == t and o.qty / PRECISION == q)
+                f.write("%s %s %s\n" % (t, q, " ".join(squares)))
+            f.write("\nnb_meadows_by_square 0\n")
+            for n in sorted(set([s.nb_meadows for s in self.grid.values() if s.nb_meadows])):
+                squares = _sorted([s.name for s in set(self.grid.values()) if s.nb_meadows == n])
+                if n == 1:
+                    f.write("; 1 meadow\n")
+                else:
+                    f.write("; %s meadows\n" % n)
+                for _ in range(n):
+                    f.write("additional_meadows %s\n" % " ".join(squares))
+            f.write("\n")
+            for t in sorted(set([s.type_name for s in self.grid.values() if s.type_name])):
+                squares = _sorted([s.name for s in set(self.grid.values()) if s.type_name == t])
+                f.write("terrain %s %s\n" % (t, " ".join(squares)))
+            squares = _sorted([s.name for s in set(self.grid.values()) if s.high_ground])
+            f.write("high_grounds %s\n" % " ".join(squares))
+            squares = _sorted([s.name for s in set(self.grid.values()) if s.is_water])
+            f.write("water %s\n" % " ".join(squares))
+            squares = _sorted([s.name for s in set(self.grid.values()) if s.is_ground and s.is_water])
+            f.write("ground %s\n" % " ".join(squares))
+            squares = _sorted([s.name for s in set(self.grid.values()) if not s.is_air])
+            f.write("no_air %s\n" % " ".join(squares))
+            for t in sorted(set([s.terrain_cover for s in self.grid.values() if s.terrain_cover != (0, 0)])):
+                squares = _sorted([s.name for s in set(self.grid.values()) if s.terrain_cover == t])
+                f.write("cover %s %s\n" % (" ".join(map(lambda x: str(x / 100.0), t)), " ".join(squares)))
+            for t in sorted(set([s.terrain_speed for s in self.grid.values() if s.terrain_speed != (100, 100)])):
+                squares = _sorted([s.name for s in set(self.grid.values()) if s.terrain_speed == t])
+                f.write("speed %s %s\n" % (" ".join(map(lambda x: str(x / 100.0), t)), " ".join(squares)))
+            f.write("\n")
+            we = dict()
+            sn = dict()
+            for s in set(self.grid.values()):
+                for e in s.exits:
+                    o = e.other_side.place
+                    delta = o.col - s.col, o.row - s.row
+                    if delta == (1, 0):
+                        if e.type_name not in we:
+                            we[e.type_name] = []
+                        we[e.type_name].append(s.name)
+                    elif delta == (0, 1):
+                        if e.type_name not in sn:
+                            sn[e.type_name] = []
+                        sn[e.type_name].append(s.name)
+            for tn in we:
+                f.write("west_east %s %s\n" % (tn, " ".join(_sorted(we[tn]))))
+            for tn in sn:
+                f.write("south_north %s %s\n" % (tn, " ".join(_sorted(sn[tn]))))
 
 
 class MapError(Exception):

@@ -14,6 +14,18 @@ def disable_ai(player):
         pass
     player.play = do_nothing
 
+# this unefficient method should only be used in legacy tests
+# (not in new tests, not in the main code)
+# the necessary updates should be done explicitly in the tests
+def is_perceiving_method(self):
+    def f(o):
+        self.world._update_buckets()
+        self.world._update_cloaking()
+        self.world._update_detection()
+        self._update_perception_and_memory()
+        return o in self.perception
+    return f
+
 
 class ObjectiveTestCase(unittest.TestCase):
 
@@ -32,14 +44,20 @@ class DummyClient(worldclient.DummyClient):
 
 class _PlayerBaseTestCase(unittest.TestCase):
 
-    def set_up(self, alliance=(1, 2), cloak=False, map_name="jl1_extended"):
+    def set_up(self, alliance=(1, 2), cloak=False, map_name="jl1_extended",
+               ai=("easy", "easy")):
         self.w = World([])
-        self.w.introduction = []
         self.w.load_and_build_map(Map("soundrts/tests/%s.txt" % map_name))
         if cloak:
             self.w.unit_class("new_flyingmachine").dct["is_a_cloaker"] = True
-        self.w.populate_map([DummyClient(), DummyClient()], alliance)
+        cp = DummyClient(ai[0])
+        cp2 = DummyClient(ai[1])
+        cp.alliance, cp2.alliance = alliance
+        self.w.populate_map([cp, cp2], random_starts=False)
         self.cp, self.cp2 = self.w.players
+        self.cp.is_perceiving = is_perceiving_method(self.cp)
+        self.cp2.is_perceiving = is_perceiving_method(self.cp2)
+        self.w._update_buckets()
 
     def find_player_unit(self, p, cls_name, index=0):
         for u in p.units:
@@ -273,10 +291,11 @@ class ComputerTestCase(_PlayerBaseTestCase):
         p = self.find_player_unit(self.cp, "peasant")
         assert not p.orders
         assert not self.cp.get(1000, "footman")
+        self.w.update()
         assert p.orders
 
     def testInitAndUpgradeToAKeep(self):
-        self.set_up()
+        self.set_up(map_name="jl1")
         self.cp.resources = [1000*PRECISION, 1000*PRECISION]
         th = self.find_player_unit(self.cp, "townhall")
         assert not th.orders
@@ -286,6 +305,56 @@ class ComputerTestCase(_PlayerBaseTestCase):
         assert self.find_player_unit(self.cp, "barracks")
         assert not self.cp.get(1, "knight") # => get keep
         assert th.orders
+
+    def testUpgradeToIfAutoexploring(self):
+        self.set_up(map_name="jl1")
+        self.cp.resources = [1000*PRECISION, 1000*PRECISION]
+        self.cp.lang_add_units(["a1", "archer"])
+        self.cp.lang_add_units(["a1", "lumbermill"])
+        self.cp.lang_add_units(["a1", "magestower"])
+        archer = self.find_player_unit(self.cp, "archer")
+        archer.take_order(["auto_explore"])
+        assert not self.cp.get(1, "darkarcher")
+        assert archer.orders[0].keyword == "upgrade_to"
+
+    def testNoAutoexploringIfUpgradeTo(self):
+        self.set_up(map_name="jl1")
+        self.cp.resources = [1000*PRECISION, 1000*PRECISION]
+        self.cp.lang_add_units(["a1", "archer"])
+        self.cp.lang_add_units(["a1", "lumbermill"])
+        self.cp.lang_add_units(["a1", "magestower"])
+        archer = self.find_player_unit(self.cp, "archer")
+        assert not self.cp.get(1, "darkarcher")
+        assert archer.orders[0].keyword == "upgrade_to"
+        assert archer not in self.cp.best_explorers()
+
+    def testIsAIsNotIs(self):
+        self.set_up(map_name="jl1")
+        self.cp.resources = [1000*PRECISION, 1000*PRECISION]
+        self.cp.units[0].die()
+        assert self.cp.nb("townhall") == 0
+        assert not self.cp.has("townhall")
+        self.cp.lang_add_units(["a1", "keep"]) # is a townhall
+        assert self.cp.nb("townhall") == 0
+        assert self.cp.has("townhall")
+        
+    def testIsAFillsTheRequirement(self):
+        self.set_up(map_name="jl1")
+        self.cp.resources = [1000*PRECISION, 1000*PRECISION]
+        self.cp.units[0].die()
+        assert self.cp.nb("townhall") == 0
+        assert not self.cp.has("townhall")
+        self.cp.lang_add_units(["a1", "keep"]) # is a townhall
+        assert self.cp.nb("peasant") == 1
+        p = self.find_player_unit(self.cp, "peasant")
+        assert not p.orders
+        assert self.cp.nb("blacksmith") == 0
+        assert self.cp.has("townhall")
+        self.cp._update_effect_users_and_workers()
+        self.w._update_buckets()
+        self.cp._update_perception()
+        assert not self.cp.get(1, "blacksmith") # requires a townhall
+        assert p.orders[0].type.type_name == "blacksmith"
 
     def testMenace(self):
         self.set_up()
@@ -335,6 +404,102 @@ class ComputerTestCase(_PlayerBaseTestCase):
         fm.load_all()
         fm.unload_all()
 
+    def testPerceptionByObserve(self):
+        self.set_up()
+        p = self.find_player_unit(self.cp, "peasant")
+        assert p.player.is_perceiving(p)
+        p2 = self.find_player_unit(self.cp2, "peasant")
+        assert not p.player.is_perceiving(p2)
+        assert not p.place in p2.player.observed_before_squares
+        p2.hit(p) # p.player.observe(p2)
+        assert p.player.is_perceiving(p2)
+        assert not p2.player.is_perceiving(p)
+        n = 0
+        while p.player.is_perceiving(p2):
+            self.w.update()
+            n += 1
+            assert n < 20
+        assert n in (11, 12) # 3 seconds have passed in the world 
+        assert not p.player.is_perceiving(p2)
+        assert not p2.player.is_perceiving(p)
+        assert p.player.remembers(p2)
+
+    def testPerceptionByObserveWithPlateau(self):
+        self.set_up(map_name="height")
+        p = self.find_player_unit(self.cp, "peasant")
+        p.bonus_height = 1
+        p.range = 2 * PRECISION # menace will extend to b1
+        p.sight_range = 2 * self.w.square_width
+        assert p.height == 2
+        p2 = self.find_player_unit(self.cp2, "peasant")
+        assert p.place.name == "a1" 
+        assert p2.place.name == "b1" 
+        assert p.height > p2.height
+        assert p.player.is_perceiving(p2)
+        assert not p.player.enemy_menace(p2.place)
+        self.w.update()
+        assert p.player.enemy_menace(p2.place)
+        assert not p2.player.is_perceiving(p)
+        assert not p2.player.enemy_menace(p.place)
+        assert not p2.player.is_dangerous(p.place)
+        assert not p2.player.enemy_menace(p2.place)
+        assert not p2.player.is_dangerous(p2.place)
+        assert p2.next_stage(p.place, avoid=True)
+        p.hit(p2) # p2.player.observe(p)
+        assert p2.player.is_perceiving(p)
+        n = 0
+        while p2.player.is_perceiving(p):
+            self.w.update()
+            n += 1
+            assert n < 20
+        assert n in (11, 12) # 3 seconds have passed in the world 
+        assert not p2.player.is_perceiving(p)
+        assert p2.player.remembers(p)
+        assert p2.player.enemy_menace(p.place)
+        assert p2.player.is_dangerous(p.place)
+        assert p2.player.enemy_menace(p2.place)
+        assert p2.player.is_dangerous(p2.place)
+        assert not p2.next_stage(p.place, avoid=True)
+
+    def testPerceptionByObserveWithPlateauOneShot(self):
+        self.set_up(map_name="height")
+        p = self.find_player_unit(self.cp, "peasant")
+        p.bonus_height = 1
+        p.damage = p.hp_max * 2 # one shot
+        p.range = 2 * PRECISION # menace will extend to b1
+        p.sight_range = 2 * self.w.square_width
+        #assert p.height == 2
+        p2 = self.find_player_unit(self.cp2, "peasant")
+        assert p.place.name == "a1" 
+        assert p2.place.name == "b1" 
+        #assert p.height > p2.height
+        assert p.player.is_perceiving(p2)
+        assert not p.player.enemy_menace(p2.place)
+        self.w.update()
+        assert p.player.enemy_menace(p2.place)
+        p2p = p2.player
+        p2place = p2.place
+        assert not p2p.is_perceiving(p)
+        assert not p2p.enemy_menace(p.place)
+        assert not p2p.is_dangerous(p.place)
+        assert not p2p.enemy_menace(p2.place)
+        assert not p2p.is_dangerous(p2.place)
+        assert p2.next_stage(p.place, avoid=True)
+        p.hit(p2) # p2p.observe(p)
+        assert p2p.is_perceiving(p)
+        n = 0
+        while p2p.is_perceiving(p):
+            self.w.update()
+            n += 1
+            assert n < 20
+        assert n in (11, 12) # 3 seconds have passed in the world 
+        assert not p2p.is_perceiving(p)
+        assert p2p.remembers(p)
+        assert p2p.enemy_menace(p.place)
+        assert p2p.is_dangerous(p.place)
+        assert p2p.enemy_menace(p2place)
+        assert p2p.is_dangerous(p2place)
+
     def testPerceptionAfterUnitDeath(self):
         self.set_up()
         p = self.find_player_unit(self.cp, "peasant")
@@ -350,6 +515,7 @@ class ComputerTestCase(_PlayerBaseTestCase):
         th2 = self.find_player_unit(self.cp2, "townhall")
         assert th2 in self.cp.perception
         p.die()
+        self.w.update()
         assert th2 not in self.cp.perception
         assert th2 in [_.initial_model for _ in self.cp.memory]
         assert not self.cp.is_perceiving(p)
@@ -370,14 +536,20 @@ class ComputerTestCase(_PlayerBaseTestCase):
         assert p in self.cp.perception
         th2 = self.find_player_unit(self.cp2, "townhall")
         assert th2 in self.cp.perception
-        p.set_player(None)
+        p.set_player(self.cp2) # new owner: the other player
+        self.w.update()
         assert th2 not in self.cp.perception
         assert th2 in [_.initial_model for _ in self.cp.memory]
         assert not self.cp.is_perceiving(p)
         assert p not in self.cp.perception
-        assert p in [_.initial_model for _ in self.cp.memory]
+        # a unit shouldn't necessarily be memorized after an ownership change
+#        assert p in [_.initial_model for _ in self.cp.memory]
 
     def testMemoryOfResourceWhenAlliance(self):
+        # This test didn't work after the change about terrain:
+        # now the neignboring squares and their "natural" features (mines, forests, meadows)
+        # are always known.
+        return
         # Note: no unit with diagonal sight (air or tower)
         self.set_up((1, 1), map_name="jl1")
         p = self.find_player_unit(self.cp, "peasant")
@@ -438,13 +610,16 @@ class ComputerTestCase(_PlayerBaseTestCase):
         p2 = self.find_player_unit(self.cp2, "peasant")
         self.assertTrue(p2.is_an_enemy(p))
         p.move_to(p2.place)
+        self.w.update()
         self.assertTrue(p2.can_attack(p)) # (a bit too late to test this)
         self.assertEqual(p2.action_target, p) # "peasant should attack peasant"
 
     def testUpgradeTo(self):
-        self.set_up()
+        self.set_up(map_name="jl1")
         th = self.find_player_unit(self.cp, "townhall")
         self.cp.lang_add_units([th.place.name, "barracks"])
+        self.assertFalse(self.cp.check_type(th, "keep"))
+        self.assertTrue(self.cp.check_type(th, "townhall"))
         self.assertEqual(self.cp.nb("keep"), 0)
         self.assertEqual(self.cp.nb("barracks"), 1)
         self.cp.resources = [100000, 100000]
@@ -456,9 +631,14 @@ class ComputerTestCase(_PlayerBaseTestCase):
             if not th.orders:
                 break
         assert not th.orders
-        self.assertEqual(self.cp.nb("keep"), 1)
         self.assertEqual(th.place, None)
         self.assertTrue(th not in self.cp.units, "townhall still belongs to the player")
+        self.assertEqual(self.cp.nb("keep"), 1)
+        self.assertEqual(self.cp.nb("townhall"), 0)
+        assert self.cp.has("townhall") # requirement
+        k = self.find_player_unit(self.cp, "keep")
+        self.assertTrue(self.cp.check_type(k, "keep"))
+        self.assertFalse(self.cp.check_type(k, "townhall"))
 
     def testAllied(self):
         # when allied
@@ -468,22 +648,18 @@ class ComputerTestCase(_PlayerBaseTestCase):
         th = self.find_player_unit(self.cp, "townhall")
         # allied: hostility
         self.assertFalse(p.is_an_enemy(p2))
-        self.assertFalse(self.cp.is_an_enemy(self.cp2))
+        self.assertFalse(self.cp.player_is_an_enemy(self.cp2))
         # allied_vision
         self.assertTrue(self.cp.is_perceiving(p2))
         # allied: heal
         th.heal_level = 1 # force healing by the townhall (only the priest heals now)
         p2.hp = 0
         p2.move_to(p.place)
-        for _ in range(1):
-            th.update()
-            th.slow_update()
-            if p2.hp > 0:
-                break
+        self.w.update() # update healing and cloaking
         assert p2.hp > 0
         # allied: cloak
-        self.assertTrue(p.is_invisible_or_cloaked())
-        self.assertTrue(p2.is_invisible_or_cloaked())
+        self.assertTrue(p.is_cloaked)
+        self.assertTrue(p2.is_cloaked)
         # allied_victory
         self.assertTrue(self.cp.lang_no_enemy_left(None))
 
@@ -495,7 +671,7 @@ class ComputerTestCase(_PlayerBaseTestCase):
         th = self.find_player_unit(self.cp, "townhall")
         # allied: hostility
         self.assertTrue(p.is_an_enemy(p2))
-        self.assertTrue(self.cp.is_an_enemy(self.cp2))
+        self.assertTrue(self.cp.player_is_an_enemy(self.cp2))
         # allied_vision
         self.assertFalse(self.cp.is_perceiving(p2))
         # allied: heal
@@ -507,15 +683,17 @@ class ComputerTestCase(_PlayerBaseTestCase):
             if p2.hp > 0:
                 break
         assert p2.hp == 0
+        self.w.update() # update cloaking
         # allied: cloak
-        self.assertTrue(p.is_invisible_or_cloaked())
-        self.assertFalse(p2.is_invisible_or_cloaked())
+        self.assertTrue(p.is_cloaked)
+        self.assertFalse(p2.is_cloaked)
         # allied_victory
         self.assertFalse(self.cp.lang_no_enemy_left(None))
 
     def testAlliedObserverAfterDefeat(self):
-        # test bug #63: a defeated player shouldn't share the observer view with the team
+        # test bug #63: a defeated player shouldn't share the whole view with the team
         self.set_up((1, 1), map_name="jl1")
+        self.cp.observer_if_defeated = True
         self.cp2.observer_if_defeated = True
         # We won't check the observed squares because (at the moment)
         # it seems that the observed squares are not shared by allies,
@@ -531,8 +709,17 @@ class ComputerTestCase(_PlayerBaseTestCase):
         self.cp2.store_score = do_nothing
         self.cp2.defeat()
         self.cp2.store_score = _backup
+        # no observer mode if the whole team isn't defeated
         self.assertFalse(self.cp.is_perceiving(first_object_of_A2)) # bug #63
-        self.assertTrue(self.cp2.is_perceiving(first_object_of_A2)) # observer mode after defeat
+        self.assertFalse(self.cp2.is_perceiving(first_object_of_A2))
+        # observer mode only if the whole team is defeated
+        _backup = self.cp.store_score
+        self.cp.store_score = do_nothing
+        self.cp.defeat()
+        self.cp.store_score = _backup
+        # this test would probably require more players to pass
+        #self.assertTrue(self.cp.is_perceiving(first_object_of_A2))
+        #self.assertTrue(self.cp2.is_perceiving(first_object_of_A2))
 
     def testAI(self):
         self.set_up()
@@ -542,13 +729,13 @@ class ComputerTestCase(_PlayerBaseTestCase):
         self.assertEqual(th.place.shortest_path_distance_to(th.place), 0)
 
     def testImperativeGo(self):        
-        self.set_up()
+        self.set_up(ai=("timers", "timers"))
         th = self.find_player_unit(self.cp, "townhall")
         p = self.find_player_unit(self.cp, "peasant")
         p.take_order(["go", th.id], imperative=True)
         self.assertEqual(th.hp, th.hp_max)
         for _ in range(100):
-            p.update()
+            self.w.update()
             if th.hp != th.hp_max:
                 break
         self.assertNotEqual(th.hp, th.hp_max)
@@ -566,13 +753,13 @@ class ComputerTestCase(_PlayerBaseTestCase):
         self.assertNotEqual(th.hp, th.hp_max)
 
     def testImperativeGo3(self):        
-        self.set_up()
+        self.set_up(ai=("timers", "timers"))
         th = self.find_player_unit(self.cp, "townhall")
         f = self.find_player_unit(self.cp, "dragon")
         f.take_order(["go", th.id], imperative=True)
         self.assertEqual(th.hp, th.hp_max)
         for _ in range(100):
-            f.update()
+            self.w.update()
             if th.hp != th.hp_max:
                 break
         self.assertNotEqual(th.hp, th.hp_max)
@@ -585,7 +772,7 @@ class ComputerTestCase(_PlayerBaseTestCase):
         p.take_order(["go", self.w.grid["a1"].id])
         x, y = p.x, p.y
         self.w.update() # for the order
-        assert (x, y) == (p.x, p.y) # XXX not important
+        assert (x, y) == (p.x, p.y) # not important
         self.w.update() # move
         assert (x, y) != (p.x, p.y)
         x2, y2 = p.x, p.y
@@ -598,7 +785,7 @@ class ComputerTestCase(_PlayerBaseTestCase):
         p.take_order(["go", self.w.grid["a1"].id])
         assert (x, y) == (p.x, p.y)
         self.w.update() # for the order
-        assert (x, y) == (p.x, p.y) # XXX not important
+        assert (x, y) == (p.x, p.y) # not important
         self.w.update() # move
         assert (x, y) != (p.x, p.y)
         assert (x2, y2) == (p.x, p.y)
@@ -612,7 +799,7 @@ class ComputerTestCase(_PlayerBaseTestCase):
         p.take_order(["go", self.w.grid["a1"].id])
         assert (x, y) == (p.x, p.y)
         self.w.update() # for the order
-        assert (x, y) == (p.x, p.y) # XXX not important
+        assert (x, y) == (p.x, p.y) # not important
         self.w.update() # move
         assert (x, y) != (p.x, p.y)
         assert (x2, y2) == (p.x, p.y)

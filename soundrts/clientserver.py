@@ -10,6 +10,7 @@ from clientversion import revision_checker
 import config
 import options
 from lib.log import info, exception
+import msgparts as mp
 import servermain
 from version import compatibility_version
 
@@ -36,37 +37,29 @@ class ServerInAThread(threading.Thread):
 def start_server_and_connect(parameters):
     info("active threads: %s", threading.enumerate())
     ServerInAThread(parameters).start()
-    # TODO: catch exceptions raised by the starting server
-    # for example: RegisteringError ProbablyNoInternetError
-    # voice.alert([4049]) # "The server couldn't probably register on the metaserver. check you are connected to the Internet."
-    # voice.alert([4080]) # "failure: the server couldn't start"
     time.sleep(.01) # Linux needs a small delay (at least on the Eee PC 4G)
     revision_checker.start_if_needed()
     connect_and_play()
     info("active threads: %s", threading.enumerate())
     sys.exit()
 
-def connect_and_play(host="127.0.0.1", port=options.port):
+def connect_and_play(host="127.0.0.1", port=options.port, auto=False):
     try:
         server = ConnectionToServer(host, port)
-        ServerMenu(server).loop()
+        ServerMenu(server, auto=auto).loop()
         server.close() # without this, the server isn't closed after a game
     except UnreachableServerError:
-        # "failure: the server unreachable. The server is closed or behind a firewall or behind a router."
-        voice.alert([4081])
+        voice.alert(mp.SERVER_UNREACHABLE)
     except WrongServerError:
-        # "failure: unexpected reply from the server. The server is not a SoundRTS server" (version)
-        voice.alert([4082, compatibility_version()])
+        voice.alert(mp.UNEXPECTED_REPLY + [compatibility_version()])
     except CompatibilityOrLoginError:
-        # "failure: connexion rejected the server. The server is not a SoundRTS server" (version)
-        # "or your login has been rejected"
-        voice.alert([4083, compatibility_version(), 4084])
+        voice.alert(mp.CONNECTION_REJECTED + [compatibility_version()] + mp.OR_LOGIN_REJECTED)
     except ConnectionAbortedError:
-        voice.alert([4102]) # connection aborted
+        voice.alert(mp.CONNECTION_INTERRUPTED)
     except SystemExit:
         raise
     except:
-        voice.alert([4085]) # "error during connexion to server"
+        voice.alert(mp.ERROR_DURING_CONNECTION)
         exception("error during connection to server")
 
 
@@ -105,10 +98,9 @@ class ConnectionToServer(object):
             self.data += self.tn.read_very_eager()
         except: # EOFError or (10054, 'Connection reset by peer')
             raise ConnectionAbortedError
-        lines = self.data.split("\n", 1)
-        self.data = lines.pop()
-        if lines:
-            return lines[0]
+        if "\n" in self.data:
+            line, self.data = self.data.split("\n", 1)
+            return line
 
     def write_line(self, s):
         try:

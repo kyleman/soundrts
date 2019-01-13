@@ -8,12 +8,19 @@ class Exit(Entity):
     collision = 0
     is_an_exit = True
 
-    def __init__(self, place, type_name):
+    def __init__(self, place, type_name, is_a_portal):
         self.type_name = type_name
+        self.is_a_portal = is_a_portal
         place, x, y, o = place
         Entity.__init__(self, place, x, y, o)
         place.exits.append(self)
         self._blockers = []
+
+    def __repr__(self):
+        try:
+            return "<Exit to '%s'>" % self.other_side.place.name
+        except:
+            return "<Exit to nowhere>"
 
     def is_blocked(self, o=None, ignore_enemy_walls=False):
         for b in self._blockers + getattr(self.other_side, "_blockers", []):
@@ -26,16 +33,6 @@ class Exit(Entity):
     def blockers(self):
         return self._blockers + getattr(self.other_side, "_blockers", [])
 
-    def use_range(self, a):
-        return a.radius + 1000 # + 10
-
-    def be_used_by(self, actor):
-        actor.move_to(self.other_side.place,
-                      self.other_side.x + 250 * int_cos_1000(self.other_side.o) / 1000, # 25 cm
-                      self.other_side.y + 250 * int_sin_1000(self.other_side.o) / 1000, # 25 cm
-                      self.other_side.o,
-                      self, self.other_side)
-
     def add_blocker(self, o):
         self._blockers.append(o)
 
@@ -46,10 +43,17 @@ class Exit(Entity):
     def is_a_building_land(self):
         return not self.is_blocked(None)
 
+    def delete(self):
+        self.place.exits.remove(self)
+        if self.other_side:
+            self.other_side.other_side = None
+            self.other_side.delete()
+        Entity.delete(self)
+
 
 def passage(places, exit_type):
-    place1, place2 = places
-    exit1 = Exit(place1, exit_type)
-    exit2 = Exit(place2, exit_type)
+    place1, place2, is_a_portal = places
+    exit1 = Exit(place1, exit_type, is_a_portal)
+    exit2 = Exit(place2, exit_type, is_a_portal)
     exit1.other_side = exit2
     exit2.other_side = exit1

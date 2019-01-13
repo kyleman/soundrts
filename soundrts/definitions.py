@@ -1,8 +1,11 @@
 import re
 
 from lib.nofloat import to_int
-from lib.log import debug, warning
+from lib.log import debug, info, warning
 from lib.defs import preprocess
+
+VIRTUAL_TIME_INTERVAL = 300 # milliseconds
+MAX_NB_OF_RESOURCE_TYPES = 10
 
 
 class _Definitions:
@@ -19,42 +22,46 @@ class _Definitions:
     def read(self, s):
         s = preprocess(s)
         d = self._dict
+        name = "(the name is missing)"
         for line in s.split("\n"):
-            words = line.split()
-            if not words: continue
-            if words[0] == "clear":
-                d.clear()
-            elif words[0] == "def":
-                name = words[1]
-                if name not in d:
-                    d[name] = {}
-            elif words[0] in self.string_properties:
-                d[name][words[0]] = words[1]
-            elif words[0] in self.int_properties:
-                d[name][words[0]] = int(words[1])
-            elif words[0] in self.precision_properties:
-                if words[0] == "effect_range" and len(words) >= 2:
-                    if words[1] == "square":
-                        words[1] = "6"
-                        warning("effect_range of %s will be 6 (instead of 'square')", name)
-                    elif words[1] == "nearby":
-                        words[1] = "12"
-                        warning("effect_range of %s will be 12 (instead of 'nearby')", name)
-                    elif words[1] == "anywhere":
+            try:
+                words = line.split()
+                if not words: continue
+                if words[0] == "clear":
+                    d.clear()
+                elif words[0] == "def":
+                    name = words[1]
+                    if name not in d:
+                        d[name] = {}
+                elif words[0] in self.string_properties:
+                    d[name][words[0]] = words[1]
+                elif words[0] in self.int_properties:
+                    d[name][words[0]] = int(words[1])
+                elif words[0] in self.precision_properties:
+                    if words[0] == "effect_range" and len(words) >= 2:
+                        if words[1] == "square":
+                            words[1] = "6"
+                            info("effect_range of %s will be 6 (instead of 'square')", name)
+                        elif words[1] == "nearby":
+                            words[1] = "12"
+                            info("effect_range of %s will be 12 (instead of 'nearby')", name)
+                        elif words[1] == "anywhere":
+                            words[1] = "2147483" # sys.maxint / 1000 (32 bits)
+                    if len(words) >= 2 and words[1] == "inf":
                         words[1] = "2147483" # sys.maxint / 1000 (32 bits)
-                if len(words) >= 2 and words[1] == "inf":
-                    words[1] = "2147483" # sys.maxint / 1000 (32 bits)
-                d[name][words[0]] = to_int(words[1])
-            elif words[0] in self.int_list_properties:
-                d[name][words[0]] = [int(x) for x in words[1:]]
-            elif words[0] in self.precision_list_properties:
-                d[name][words[0]] = [to_int(x) for x in words[1:]]
-            else:
-                if words[0] == "effect" and words[1] == "bonus" and words[2] in self.precision_properties:
-                    words[3] = to_int(words[3])
-                    if len(words) > 4: # apparently this case doesn't happen at the moment
-                        words[4] = to_int(words[4])
-                d[name][words[0]] = words[1:]
+                    d[name][words[0]] = to_int(words[1])
+                elif words[0] in self.int_list_properties:
+                    d[name][words[0]] = [int(x) for x in words[1:]]
+                elif words[0] in self.precision_list_properties:
+                    d[name][words[0]] = [to_int(x) for x in words[1:]]
+                else:
+                    if words[0] == "effect" and words[1] == "bonus" and words[2] in self.precision_properties:
+                        words[3] = to_int(words[3])
+                        if len(words) > 4: # apparently this case doesn't happen at the moment
+                            words[4] = to_int(words[4])
+                    d[name][words[0]] = words[1:]
+            except:
+                warning("error in definition of %s: %s", name, line)
 
     def apply_inheritance(self, expanded_is_a=False):
         d = self._dict
@@ -140,6 +147,7 @@ _precision_properties = (
                 "mana_regen",
                 "speed", 
                 "effect_range", "effect_radius",
+                "sight_range", "cloaking_range", "detection_range",
                 )
 _precision_properties_extended = []
 for _ in _precision_properties:
@@ -152,6 +160,7 @@ class Rules(_Definitions):
 
     string_properties = ("airground_type",)
     int_properties = (
+                    "nb_of_resource_types", # only in parameters
                     "collision",
                     "corpse",
                     "food_cost", "food_provided",
@@ -176,6 +185,7 @@ class Rules(_Definitions):
                     "is_teleportable",
                     "is_a_gate",
                     "is_buildable_on_exits_only",
+                    "is_buildable_near_water_only",
                     "count_limit",
                     )
     precision_properties = _precision_properties_extended

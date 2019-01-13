@@ -1,10 +1,11 @@
 import string
 
-from constants import COLLISION_RADIUS
 from lib.msgs import nb2msg
 from lib.nofloat import int_distance, int_angle, int_cos_1000, int_sin_1000
 from lib.priodict import priorityDictionary
-from worldresource import Meadow
+from worldentity import COLLISION_RADIUS
+from worldexit import passage
+from worldresource import Deposit, Meadow
 
 
 SPACE_LIMIT = 144
@@ -24,9 +25,32 @@ def square_spiral(x, y, step=COLLISION_RADIUS * 25 / 10):
         sign *= -1
 
 
+_cache = {}
+_cache_time = None
+
+
+def cache(f):
+    def decorated_f(*args, **kargs):
+        global _cache, _cache_time
+        if _cache_time != args[0].world.time:
+            _cache = {}
+            _cache_time = args[0].world.time
+        k = (args, tuple(sorted(kargs.items())))
+        if k not in _cache:
+            _cache[k] = f(*args, **kargs)   
+        return _cache[k]
+    return decorated_f
+
+
 class Square(object):
 
     transport_capacity = 0
+    type_name = ""
+    terrain_speed = (100, 100)
+    terrain_cover = (0, 0)
+    is_ground = True
+    is_water = False
+    is_air = True
 
     def __init__(self, world, col, row, width):
         self.col = col
@@ -47,6 +71,9 @@ class Square(object):
         self.x = (self.xmax + self.xmin) / 2
         self.y = (self.ymax + self.ymin) / 2
 
+    def __repr__(self):
+        return "<'%s'>" % self.name
+
     @property
     def height(self):
         if self.high_ground:
@@ -54,14 +81,24 @@ class Square(object):
         else:
             return 0
 
-    def set_neighbours(self):
+    @property
+    def strict_neighbors(self):
+        result = []
+        for dc, dr in ((0, 1), (0, -1), (1, 0), (-1, 0)):
+            s = self.world.grid.get((self.col + dc, self.row + dr))
+            if s is not None:
+                result.append(s)
+        return result
+ 
+
+    def set_neighbors(self):
         result = []
         for dc, dr in ((0, 1), (0, -1), (1, 0), (-1, 0),
                        (1, 1), (1, -1), (-1, 1), (-1, -1)):
             s = self.world.grid.get((self.col + dc, self.row + dr))
             if s is not None:
                 result.append(s)
-        self.neighbours = result
+        self.neighbors = result
 
     @property
     def building_land(self):
@@ -69,12 +106,20 @@ class Square(object):
             if o.is_a_building_land:
                 return o
 
+    @property
+    def is_near_water(self):
+        if not self.is_ground or self.high_ground:
+            return False
+        for sq in self.strict_neighbors:
+            if sq.is_water:
+                return True
+
     def __getstate__(self):
         d = self.__dict__.copy()
         if d.has_key('spiral'):
             del d['spiral']
-        if d.has_key('neighbours'):
-            del d['neighbours']
+        if d.has_key('neighbors'):
+            del d['neighbors']
         return d
 
     def __setstate__(self, d):
@@ -95,29 +140,36 @@ class Square(object):
         return self.xmin <= x < self.xmax and \
                self.ymin <= y < self.ymax
 
-    def shortest_path_to(self, dest, player=None):
-##        if len(self.exits) == 1: # small optimization
-##            return self.exits[0]
-        return self._shortest_path_to(dest, player)[0]
+    def shortest_path_to(self, dest, player=None, plane="ground", places=False, avoid=False):
+        if places:
+            return self._shortest_path_to(dest, plane, player, places=True, avoid=avoid)
+        else:
+            return self._shortest_path_to(dest, plane, player, avoid=avoid)[0]
 
-    def shortest_path_distance_to(self, dest, player=None):
-        return self._shortest_path_to(dest, player)[1]
+    def shortest_path_distance_to(self, dest, player=None, plane="ground", avoid=False):
+        return self._shortest_path_to(dest, plane, player, avoid=avoid)[1]
 
-    def _shortest_path_to(self, dest, player):
+    @cache
+    def _shortest_path_to(self, dest, plane, player, places=False, avoid=False):
         """Returns the next exit to the shortest path from self to dest
         and the distance of the shortest path from self to dest."""
         # TODO: remove the duplicate exits in the graph
+        if avoid:
+            avoid = player.is_very_dangerous
+        else:
+            avoid = lambda x: False
         if dest is self:
-            return None, 0
+            return [self] if places else (None, 0)
 ##        if not dest.exits: # small optimization
 ##            return None, None # no path exists
 
         # add start and end to the graph
-        G = self.world.g
-        for v in (self, dest):
-            G[v] = {}
-            for e in v.exits:
-                G[v][e] = G[e][v] = int_distance(v.x, v.y, e.x, e.y)
+        G = self.world.g[plane]
+        if plane == "ground":
+            for v in (self, dest):
+                G[v] = {}
+                for e in v.exits:
+                    G[v][e] = G[e][v] = int_distance(v.x, v.y, e.x, e.y)
         start = self
         end = dest
 
@@ -128,13 +180,13 @@ class Square(object):
         Q[start] = (0, )
 
         for v in Q:
-            if hasattr(v, "is_blocked") and v.is_blocked(player, ignore_enemy_walls=True):
+            if hasattr(v, "is_blocked") and v.is_blocked(player, ignore_enemy_walls=True) or avoid(v):
                 continue
             D[v] = Q[v][0]
             if v == end: break
             
             for w in G[v]:
-                if hasattr(w, "is_blocked") and w.is_blocked(player, ignore_enemy_walls=True):
+                if hasattr(w, "is_blocked") and w.is_blocked(player, ignore_enemy_walls=True) or avoid(w):
                     continue
                 vwLength = D[v] + G[v][w]
                 if w in D:
@@ -144,21 +196,26 @@ class Square(object):
                     P[w] = v
 
         # restore the graph
-        for v in (start, end):
-            del G[v]
-            for e in v.exits:
-                del G[e][v]
+        if plane == "ground":
+            for v in (start, end):
+                del G[v]
+                for e in v.exits:
+                    del G[e][v]
 
         # exploit the results
         if end not in P:
-            return None, None # no path exists
+            # no path exists
+            return [] if places else (None, None)
         Path = []
         while 1:
             Path.append(end)
             if end == start: break
             end = P[end]
         Path.reverse()
-        return Path[1], D[dest]
+        if places:
+            return [e.place for e in Path if hasattr(e, "other_side")]
+        else:
+            return Path[1], D[dest]
 
     def find_nearest_meadow(self, unit):
         def _d(o):
@@ -178,33 +235,12 @@ class Square(object):
                 return x, y, o
         return self.x, self.y, None
 
-    def update_menace(self):
-        self.menace = {}
-        for player in self.world.players:
-            self.menace[player] = 0
-        for o in self.objects:
-            if hasattr(o, "player"):
-                if self.menace.has_key(o.player):
-                    self.menace[o.player] += o.menace
-                else:
-                    self.menace[o.player] = o.menace
-
     def contains_enemy(self, player):
         for o in self.objects:
-            if hasattr(o, "player") and player.is_an_enemy(o):
+            if player.is_an_enemy(o):
                 return True
         return False
         
-    def balance(self, player):
-        self.update_menace()
-        balance = 0
-        for p in self.world.players:
-            if p.is_an_enemy(player):
-                balance -= self.menace[p]
-            elif p in player.allied:
-                balance += self.menace[p]
-        return balance
-
     def north_side(self):
         return self, self.x, self.ymax - 1, -90
 
@@ -223,10 +259,11 @@ class Square(object):
         return int_angle(xc, yc, self.col * 10 + 5, self.row * 10 + 5)
 
     def arrange_resources_symmetrically(self, xc, yc):
+        things = [o for o in self.objects if isinstance(o, (Deposit, Meadow))]
         square_width = self.xmax - self.xmin
-        nb = len(self.objects)
+        nb = len(things)
         shift = self._shift(xc, yc)
-        for i, o in enumerate(self.objects):
+        for i, o in enumerate(things):
             x = self.x
             y = self.y
             if nb > 1:
@@ -258,6 +295,7 @@ class Square(object):
                 self.spiral = {}
                 self.spiral["ground"] = square_spiral(x, y)
                 self.spiral["air"] = square_spiral(x, y)
+                self.spiral["water"] = square_spiral(x, y)
             spiral = self.spiral[airground_type] # reuse spiral (don't retry used places: much faster!)
         else:
             spiral = square_spiral(x, y)
@@ -266,3 +304,65 @@ class Square(object):
                not self.world.collision[airground_type].would_collide(x, y):
                 return x, y
         return None, None
+
+    def ensure_path(self, other):
+        if other not in [e.other_side.place for e in self.exits]:
+            x = (self.x + other.x) / 2
+            y = (self.y + other.y) / 2
+            passage(((self, x, y, 0), (other, x, y, 0), False), "path")
+            self.world._create_graphs()
+
+    def ensure_nopath(self, other):
+        for e in self.exits:
+            if other == e.other_side.place:
+                e.delete()
+
+    def toggle_path(self, dc, dr):
+        other = self.world.grid.get((self.col + dc, self.row + dr))
+        if not other: # border
+            return
+        if other in [e.other_side.place for e in self.exits]:
+            self.ensure_nopath(other)
+        else:
+            self.ensure_path(other)
+            return True
+
+    def ensure_meadows(self, n):
+        for o in self.objects[:]:
+            if n >= self.nb_meadows:
+                break
+            if o.is_a_building_land and not getattr(o, "is_an_exit", False):
+                o.delete()
+        for _ in range(n - self.nb_meadows):
+            Meadow(self)
+        self.arrange_resources_symmetrically(self.x, self.y)
+
+    def ensure_resources(self, t, n, q):
+        for o in self.objects[:]:
+            if o.type_name == t:
+                o.delete()
+        for _ in range(n):
+            self.world.unit_class(t)(self, q)
+
+    @property
+    def nb_meadows(self):
+        return len([o for o in self.objects if o.is_a_building_land and not getattr(o, "is_an_exit", False) or o.building_land and not getattr(o, "qty", 0)])
+
+    def update_terrain(self):
+        meadows = len([o for o in self.objects if o.type_name == "meadow"])
+        woods = len([o for o in self.objects if o.type_name == "wood"])
+        if woods >= 3:
+            self.type_name = "_dense_forest"
+        elif woods:
+            self.type_name = "_forest"
+        elif meadows:
+            self.type_name = "_meadows"
+        else:
+            self.type_name = ""
+        # dynamic path through forest
+        if self.type_name == "_dense_forest":
+            for s in self.strict_neighbors:
+                if s.type_name == "_dense_forest":
+                    self.ensure_nopath(s)
+                elif s.high_ground == self.high_ground:
+                    self.ensure_path(s)
